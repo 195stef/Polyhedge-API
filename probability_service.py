@@ -135,7 +135,24 @@ def predict(strike: float, expiry: int):
 
 @app.get("/status")
 def status():
-    return {"status": "online", "timestamp": datetime.now().isoformat()}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        count = pd.read_sql("SELECT COUNT(*) as n FROM prices", conn).iloc[0,0]
+        oldest = pd.read_sql('SELECT MIN("Open time") as t FROM prices', conn).iloc[0,0]
+        newest = pd.read_sql('SELECT MAX("Open time") as t FROM prices', conn).iloc[0,0]
+        conn.close()
+        return {
+            "status": "online",
+            "timestamp": datetime.now().isoformat(),
+            "database": {
+                "candles": int(count),
+                "oldest": oldest,
+                "newest": newest,
+                "interval": "5min"
+            }
+        }
+    except Exception as e:
+        return {"status": "online", "timestamp": datetime.now().isoformat(), "database": {"error": str(e)}}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
