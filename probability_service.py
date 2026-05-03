@@ -44,7 +44,7 @@ def sync_data():
     new_data = []
     
     while last_ts < current_ts - 60000:
-        url = f"https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1m&startTime={last_ts + 1}&limit=1000"
+        url = f"https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&startTime={last_ts + 1}&limit=1000"
         res = requests.get(url).json()
         if not res or len(res) == 0: break
         
