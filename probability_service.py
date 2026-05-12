@@ -161,23 +161,27 @@ async def predict(expiry: float, strike: float = None):
     if expiry <= 0 or expiry > 365:
         return {"error": "Please use an expiry value between 0 and 365 days"}
 
-    # Load 6 years of data to ensure maximum accuracy and sample size
-    closes_6y = load_closes(days_of_history=2190)
-
-    if closes_6y.empty:
-        return {"error": "Database is empty or still syncing. Please wait a few minutes."}
+    # Try loading 6 years, fallback to 2 years, then fallback to anything we have
+    closes = load_closes(days_of_history=2190)
+    if closes.empty:
+        closes = load_closes(days_of_history=730)
+    if closes.empty:
+        closes = load_closes(days_of_history=30) # Minimum 30 days to give a result
+        
+    if closes.empty:
+        return {"error": "Database is still syncing initial data. Please try again in 5 minutes."}
 
     # IMPORTANT: Use live price as the anchor
     live_p = get_live_price()
-    current_price = live_p if live_p else float(closes_6y.iloc[-1])
+    current_price = live_p if live_p else float(closes.iloc[-1])
     
     if strike is None:
         strike = current_price
 
     intervals_ahead = int(expiry * 24 * 12)
-    vals = closes_6y.values
+    vals = closes.values
     if len(vals) <= intervals_ahead or intervals_ahead == 0:
-         return {"error": f"Not enough historical data for a {expiry}-day forecast."}
+         return {"error": f"Not enough historical data synced yet for a {expiry}-day forecast. Currently have {len(vals)} data points."}
     
     # Vectorized calculation: (Price_at_T+N / Price_at_T) - 1
     start_prices = vals[:-hours_ahead]
@@ -242,7 +246,7 @@ async def auto_sync_loop():
             await loop.run_in_executor(None, sync_data)
         except Exception as e:
             print(f"Auto-sync error: {e}")
-        await asyncio.sleep(600)  # Every 10 minutes
+        await asyncio.sleep(60)  # Every 1 minute to catch up faster
 
 
 @app.on_event("startup")
