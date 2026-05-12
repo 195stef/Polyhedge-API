@@ -184,8 +184,8 @@ async def predict(expiry: float, strike: float = None):
          return {"error": f"Not enough historical data synced yet for a {expiry}-day forecast. Currently have {len(vals)} data points."}
     
     # Vectorized calculation: (Price_at_T+N / Price_at_T) - 1
-    start_prices = vals[:-hours_ahead]
-    end_prices = vals[hours_ahead:]
+    start_prices = vals[:-intervals_ahead]
+    end_prices = vals[intervals_ahead:]
     fwd_returns = (end_prices / start_prices) - 1
     
     # Required return to hit strike
