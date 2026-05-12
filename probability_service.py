@@ -1,18 +1,16 @@
-import sqlite3
-import pandas as pd
-import requests
-import time
-from datetime import datetime
-import os
-import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-import threading
+import pandas as pd
+import sqlite3
+import requests
+import time
+import asyncio
+import numpy as np
+from datetime import datetime, timedelta
+import os
 
-app = FastAPI()
+app = FastAPI(title="Polyhedger BTC Forecaster API v2")
 
-# Configurazione CORS per permettere al frontend di chiamare l'API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,202 +19,239 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Relative to workspace root if run from there
 DB_PATH = "bitcoin_data.db"
 
-# Global sync diagnostics
-sync_status = {
-    "last_run": None,
-    "last_result": "never_run",
-    "last_error": None,
-    "candles_added_last_run": 0,
-    "total_runs": 0
-}
+# ─────────────────────────────────────────────────────────
+# DATA SYNC
+# ─────────────────────────────────────────────────────────
 
 def sync_data():
-    """Funzione per scaricare i dati mancanti da Binance"""
-    global sync_status
-    sync_status["last_run"] = datetime.now().isoformat()
-    sync_status["total_runs"] += 1
-
+    """Download missing 1-minute candles from Binance and store in SQLite."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute('''CREATE TABLE IF NOT EXISTS prices 
                    ("Open time" TEXT, Open REAL, High REAL, Low REAL, Close REAL, Volume REAL, symbol TEXT)''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_time ON prices("Open time")')
-    
+
     try:
-        last_time = pd.read_sql("SELECT MAX(\"Open time\") FROM prices", conn).iloc[0,0]
+        cursor = conn.cursor()
+        cursor.execute('SELECT MAX("Open time") FROM prices')
+        last_time = cursor.fetchone()[0]
         if last_time:
             last_ts = int(datetime.fromisoformat(last_time).timestamp() * 1000)
-            print(f"[SYNC] Ultimo dato in DB: {last_time}")
         else:
-            print("[SYNC] Database vuoto. Parto dal 2024-01-01...")
-            last_ts = int(datetime(2024, 1, 1).timestamp() * 1000)
+            # START FROM 2019 to ensure 6y history (today is 2026)
+            print("Empty DB. Starting sync from 2019-01-01...")
+            last_ts = int(datetime(2019, 1, 1).timestamp() * 1000)
     except Exception as e:
-        print(f"[SYNC] Errore lettura DB: {e}")
-        last_ts = int(datetime(2024, 1, 1).timestamp() * 1000)
+        print(f"Init Error: {e}. Starting from 2019-01-01...")
+        last_ts = int(datetime(2019, 1, 1).timestamp() * 1000)
 
     current_ts = int(time.time() * 1000)
-    gap_minutes = (current_ts - last_ts) / 60000
-    print(f"[SYNC] Gap da colmare: {gap_minutes:.0f} minuti ({gap_minutes/60:.1f} ore)")
 
-    new_data = []
-    batches = 0
-
-    while last_ts < current_ts - 300000:  # stop 5 min before now
-        url = f"https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&startTime={last_ts + 1}&limit=1000"
+    while last_ts < current_ts - 60000:
+        url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime={last_ts + 60000}&limit=1000"
         try:
-            response = requests.get(url, timeout=15)
-            print(f"[SYNC] Binance HTTP status: {response.status_code}")
-            res = response.json()
+            res = requests.get(url, timeout=10).json()
+            if not res or (isinstance(res, dict) and 'code' in res):
+                print(f"Binance error or no more data: {res}")
+                break
+            batch = [{
+                'Open time': datetime.fromtimestamp(k[0] / 1000).strftime('%Y-%m-%d %H:%M:%S'),
+                'Open': float(k[1]), 'High': float(k[2]), 'Low': float(k[3]),
+                'Close': float(k[4]), 'Volume': float(k[5]), 'symbol': 'BTCUSDT'
+            } for k in res]
+            pd.DataFrame(batch).to_sql('prices', conn, if_exists='append', index=False)
+            last_ts = res[-1][0]
+            print(f"Sync: up to {batch[-1]['Open time']}")
+            # Small sleep to be nice to API
+            time.sleep(0.1)
         except Exception as e:
-            print(f"[SYNC] ERRORE richiesta Binance: {e}")
-            sync_status["last_error"] = str(e)
-            sync_status["last_result"] = "fetch_error"
+            print(f"Sync error: {e}")
             break
-
-        # Check if Binance returned an error dict instead of a list
-        if isinstance(res, dict):
-            print(f"[SYNC] ERRORE Binance API: {res}")
-            sync_status["last_error"] = str(res)
-            sync_status["last_result"] = "binance_api_error"
-            break
-
-        if not res or len(res) == 0:
-            print("[SYNC] Nessun dato restituito da Binance. Fine sync.")
-            break
-
-        for k in res:
-            try:
-                new_data.append((
-                    datetime.fromtimestamp(k[0]/1000).isoformat(),
-                    float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]), 'BTCUSDT'
-                ))
-            except Exception as e:
-                print(f"[SYNC] Errore parsing candela: {e} - raw: {k}")
-
-        last_ts = res[-1][0]
-        batches += 1
-        print(f"[SYNC] Batch {batches}: aggiornato fino al {datetime.fromtimestamp(last_ts/1000)} ({len(new_data)} candele totali)")
-
-        if len(res) < 1000:
-            print("[SYNC] Fine dati disponibili da Binance.")
-            break
-        time.sleep(0.5)
-
-    if new_data:
-        df_new = pd.DataFrame(new_data, columns=["Open time", "Open", "High", "Low", "Close", "Volume", "symbol"])
-        df_new.to_sql("prices", conn, if_exists="append", index=False)
-        print(f"[SYNC] ✅ Salvate {len(new_data)} nuove candele nel DB.")
-        sync_status["candles_added_last_run"] = len(new_data)
-        sync_status["last_result"] = "success"
-        sync_status["last_error"] = None
-    else:
-        print("[SYNC] Nessuna nuova candela da salvare.")
-        sync_status["candles_added_last_run"] = 0
-        if sync_status["last_result"] not in ("fetch_error", "binance_api_error"):
-            sync_status["last_result"] = "up_to_date"
 
     conn.close()
+    print(f"✅ Sync complete at {datetime.now().strftime('%H:%M:%S')}")
 
-def auto_sync_loop():
-    while True:
-        try:
-            print(f"[SYNC LOOP] Avvio sync alle {datetime.now().isoformat()}")
-            sync_data()
-        except Exception as e:
-            print(f"[SYNC LOOP] Eccezione non gestita: {e}")
-            sync_status["last_error"] = str(e)
-            sync_status["last_result"] = "unhandled_exception"
-        print(f"[SYNC LOOP] Prossima sync tra 10 minuti.")
-        time.sleep(600)
 
-@app.on_event("startup")
-def startup_event():
-    print("[STARTUP] Avvio thread di sincronizzazione Binance...")
-    thread = threading.Thread(target=auto_sync_loop, daemon=True)
-    thread.start()
-    print("[STARTUP] Thread avviato.")
+# ─────────────────────────────────────────────────────────
+# CORE FORECASTING ENGINE
+# ─────────────────────────────────────────────────────────
 
-def get_prediction(strike_price, minutes_to_expiry):
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql("SELECT \"Open time\", Close FROM prices ORDER BY \"Open time\" DESC LIMIT 100000", conn)
-    conn.close()
-    
-    if len(df) < minutes_to_expiry + 1000:
-        return {"error": "Dati insufficienti per la predizione"}
-
-    df = df.iloc[::-1].reset_index(drop=True)
-    df['returns'] = df['Close'].pct_change()
-    df['volatility'] = df['returns'].rolling(window=60).std()
-    
-    current_vol = df['volatility'].iloc[-1]
-    vol_quartiles = df['volatility'].quantile([0.25, 0.5, 0.75])
-    
-    if current_vol <= vol_quartiles[0.25]:
-        regime = "Low Vol (Q1)"
-        filtered_df = df[df['volatility'] <= vol_quartiles[0.25]]
-    elif current_vol <= vol_quartiles[0.5]:
-        regime = "Med-Low Vol (Q2)"
-        filtered_df = df[(df['volatility'] > vol_quartiles[0.25]) & (df['volatility'] <= vol_quartiles[0.5])]
-    elif current_vol <= vol_quartiles[0.75]:
-        regime = "Med-High Vol (Q3)"
-        filtered_df = df[(df['volatility'] > vol_quartiles[0.5]) & (df['volatility'] <= vol_quartiles[0.75])]
-    else:
-        regime = "High Vol (Q4)"
-        filtered_df = df[df['volatility'] > vol_quartiles[0.75]]
-
-    current_price = df['Close'].iloc[-1]
-    target_return = (strike_price / current_price) - 1
-    
-    # Calcolo dei ritorni storici proiettati
-    sample_returns = []
-    for i in filtered_df.index:
-        if i + minutes_to_expiry < len(df):
-            fwd_return = (df['Close'].iloc[i + minutes_to_expiry] / df['Close'].iloc[i]) - 1
-            sample_returns.append(fwd_return)
-    
-    if not sample_returns:
-        return {"error": "Nessun campione storico trovato per questo regime"}
-        
-    hits = sum(1 for r in sample_returns if r >= target_return)
-    probability = (hits / len(sample_returns)) * 100
-    
-    return {
-        "probability": round(probability, 2),
-        "regime": regime,
-        "current_price": round(current_price, 2),
-        "required_move": f"{round(target_return * 100, 2)}%",
-        "samples": len(sample_returns)
-    }
-
-@app.get("/predict")
-def predict(strike: float, expiry: int):
-    return get_prediction(strike, expiry)
-
-@app.get("/sync-status")
-def get_sync_status():
-    return {"sync": sync_status}
-
-@app.get("/status")
-def status():
+def load_closes(days_of_history: int) -> pd.Series:
+    """Load closing prices for the last N days (5-minute granularity for precision)."""
     try:
         conn = sqlite3.connect(DB_PATH)
-        count = pd.read_sql("SELECT COUNT(*) as n FROM prices", conn).iloc[0,0]
-        oldest = pd.read_sql('SELECT MIN("Open time") as t FROM prices', conn).iloc[0,0]
-        newest = pd.read_sql('SELECT MAX("Open time") as t FROM prices', conn).iloc[0,0]
+        cutoff = (datetime.now() - timedelta(days=days_of_history)).strftime('%Y-%m-%d %H:%M:%S')
+        df = pd.read_sql(
+            f'SELECT "Open time", Close FROM prices WHERE "Open time" >= ? ORDER BY "Open time" ASC',
+            conn, params=(cutoff,)
+        )
         conn.close()
+        if df.empty:
+            return pd.Series(dtype=float)
+        
+        df['Open time'] = pd.to_datetime(df['Open time'])
+        df = df.set_index('Open time')
+        # Resample to 5-minute for high precision
+        df_5m = df['Close'].resample('5min').last().dropna()
+        return df_5m
+    except Exception as e:
+        print(f"Load Closes Error: {e}")
+        return pd.Series(dtype=float)
+
+
+def compute_forecast(closes: pd.Series, days_ahead: float) -> dict | None:
+    """
+    Vectorized computation of forward returns.
+    """
+    intervals_ahead = int(days_ahead * 24 * 12) # 12 intervals per hour (5 min)
+    if len(closes) < intervals_ahead + 10:
+        return None
+
+    vals = closes.values
+    if len(vals) <= intervals_ahead:
+        return None
+        
+    start_prices = vals[:-intervals_ahead]
+    end_prices = vals[intervals_ahead:]
+    returns = (end_prices / start_prices) - 1
+    
+    s = pd.Series(returns)
+    return {
+        "p10": float(s.quantile(0.10)),
+        "p25": float(s.quantile(0.25)),
+        "p50": float(s.quantile(0.50)),
+        "p75": float(s.quantile(0.75)),
+        "p90": float(s.quantile(0.90)),
+        "mean": float(s.mean()),
+        "samples": int(len(s))
+    }
+
+
+def prob_above(returns: np.ndarray | pd.Series, required_return: float) -> float:
+    """What fraction of historical windows achieved >= required_return?"""
+    if len(returns) == 0:
+        return 0.0
+    hits = (returns >= required_return).sum()
+    return round(float(hits / len(returns)) * 100, 1)
+
+
+# ── LIVE PRICE ──
+def get_live_price():
+    """Get the absolute latest price from Binance ticker."""
+    try:
+        res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5).json()
+        return float(res['price'])
+    except:
+        return None
+
+@app.get("/price")
+async def price():
+    p = get_live_price()
+    return {"price": p, "timestamp": datetime.now().isoformat()}
+
+
+# ─────────────────────────────────────────────────────────
+# API ENDPOINTS
+# ─────────────────────────────────────────────────────────
+
+@app.get("/predict")
+async def predict(expiry: float, strike: float = None):
+    if expiry <= 0 or expiry > 365:
+        return {"error": "Please use an expiry value between 0 and 365 days"}
+
+    # Load 6 years of data to ensure maximum accuracy and sample size
+    closes_6y = load_closes(days_of_history=2190)
+
+    if closes_6y.empty:
+        return {"error": "Database is empty or still syncing. Please wait a few minutes."}
+
+    # IMPORTANT: Use live price as the anchor
+    live_p = get_live_price()
+    current_price = live_p if live_p else float(closes_6y.iloc[-1])
+    
+    if strike is None:
+        strike = current_price
+
+    intervals_ahead = int(expiry * 24 * 12)
+    vals = closes_6y.values
+    if len(vals) <= intervals_ahead or intervals_ahead == 0:
+         return {"error": f"Not enough historical data for a {expiry}-day forecast."}
+    
+    # Vectorized calculation: (Price_at_T+N / Price_at_T) - 1
+    start_prices = vals[:-hours_ahead]
+    end_prices = vals[hours_ahead:]
+    fwd_returns = (end_prices / start_prices) - 1
+    
+    # Required return to hit strike
+    required_ret = (strike / current_price) - 1
+    
+    # Probability: percentage of historical periods that hit the required return
+    probability = prob_above(fwd_returns, required_ret)
+    
+    # Calculate regime based on standard deviation of recent returns
+    # We take the last 30 days of hourly returns
+    recent_returns = (vals[-720:] / vals[-721:-1]) - 1 if len(vals) > 720 else fwd_returns
+    volatility = np.std(recent_returns) * np.sqrt(24 * 365) * 100 # Annualized
+    
+    if volatility < 40:
+        regime = "Low Vol"
+    elif volatility < 65:
+        regime = "Med-Low Vol"
+    elif volatility < 85:
+        regime = "Moderate Vol"
+    elif volatility < 110:
+        regime = "High Vol"
+    else:
+        regime = "Extreme Vol"
+        
+    req_move_str = f"{'+' if required_ret > 0 else ''}{required_ret * 100:.2f}%"
+
+    return {
+        "probability": probability,
+        "regime": regime,
+        "current_price": round(current_price, 2),
+        "required_move": req_move_str,
+        "samples": len(fwd_returns)
+    }
+
+
+@app.get("/status")
+async def status():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        res = pd.read_sql('SELECT COUNT(*) as count, MAX("Open time") as last FROM prices', conn)
+        conn.close()
+        live = get_live_price()
         return {
-            "status": "online",
-            "timestamp": datetime.now().isoformat(),
-            "database": {
-                "candles": int(count),
-                "oldest": oldest,
-                "newest": newest,
-                "interval": "5min"
-            }
+            "total_records": int(res.iloc[0, 0]),
+            "last_db_record": res.iloc[0, 1],
+            "live_binance_price": live,
+            "status": "online"
         }
     except Exception as e:
-        return {"status": "online", "timestamp": datetime.now().isoformat(), "database": {"error": str(e)}}
+        return {"status": "no_data", "error": str(e), "total_records": 0}
+
+
+async def auto_sync_loop():
+    while True:
+        try:
+            # Run the heavy sync in a separate thread to avoid blocking the event loop
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, sync_data)
+        except Exception as e:
+            print(f"Auto-sync error: {e}")
+        await asyncio.sleep(600)  # Every 10 minutes
+
+
+@app.on_event("startup")
+async def startup_event():
+    # Start the loop as a background task
+    asyncio.create_task(auto_sync_loop())
+
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
